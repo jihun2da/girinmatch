@@ -2,8 +2,10 @@
 import streamlit as st
 import pandas as pd
 from collections import defaultdict, Counter
-from openpyxl import load_workbook
+from openpyxl import load_workbook, Workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font, Fill, Border, Alignment, Protection
+from copy import copy
 from pathlib import Path
 import os
 
@@ -24,6 +26,101 @@ with st.expander("ℹ️ 사용 안내", expanded=False):
     - 100열 초과 시 처음 100열만 처리됩니다.
     - 메모리 부족 시 파일을 분할하여 처리하세요.
     """)
+
+# ----------------------- 셀 스타일 복사 -----------------------
+def copy_cell_style(source_cell, target_cell):
+    """
+    원본 셀의 스타일을 대상 셀로 복사합니다.
+    """
+    try:
+        if source_cell.has_style:
+            # 폰트 복사
+            if source_cell.font:
+                target_cell.font = copy(source_cell.font)
+            
+            # 채우기(배경색) 복사
+            if source_cell.fill:
+                target_cell.fill = copy(source_cell.fill)
+            
+            # 테두리 복사
+            if source_cell.border:
+                target_cell.border = copy(source_cell.border)
+            
+            # 정렬 복사
+            if source_cell.alignment:
+                target_cell.alignment = copy(source_cell.alignment)
+            
+            # 숫자 형식 복사
+            if source_cell.number_format:
+                target_cell.number_format = source_cell.number_format
+            
+            # 보호 복사
+            if source_cell.protection:
+                target_cell.protection = copy(source_cell.protection)
+    except Exception as e:
+        pass  # 스타일 복사 실패는 무시
+
+def copy_row_with_style(source_ws, target_ws, source_row_idx, target_row_idx, max_col):
+    """
+    원본 워크시트의 특정 행을 대상 워크시트로 스타일 포함하여 복사합니다.
+    """
+    try:
+        for col in range(1, max_col + 1):
+            source_cell = source_ws.cell(row=source_row_idx, column=col)
+            target_cell = target_ws.cell(row=target_row_idx, column=col)
+            
+            # 값 복사
+            target_cell.value = source_cell.value
+            
+            # 스타일 복사
+            copy_cell_style(source_cell, target_cell)
+        
+        # 행 높이 복사
+        if source_ws.row_dimensions[source_row_idx].height:
+            target_ws.row_dimensions[target_row_idx].height = source_ws.row_dimensions[source_row_idx].height
+    except Exception as e:
+        pass  # 행 복사 실패는 무시
+
+def copy_column_widths(source_ws, target_ws):
+    """
+    열 너비를 복사합니다.
+    """
+    try:
+        for col_letter in source_ws.column_dimensions:
+            if source_ws.column_dimensions[col_letter].width:
+                target_ws.column_dimensions[col_letter].width = source_ws.column_dimensions[col_letter].width
+    except Exception as e:
+        pass
+
+def copy_entire_sheet(source_ws, target_ws):
+    """
+    시트 전체를 스타일 포함하여 복사합니다.
+    """
+    try:
+        max_row = source_ws.max_row
+        max_col = source_ws.max_column
+        
+        # 모든 셀 복사
+        for row in range(1, max_row + 1):
+            for col in range(1, max_col + 1):
+                source_cell = source_ws.cell(row=row, column=col)
+                target_cell = target_ws.cell(row=row, column=col)
+                
+                # 값 복사
+                target_cell.value = source_cell.value
+                
+                # 스타일 복사
+                copy_cell_style(source_cell, target_cell)
+        
+        # 열 너비 복사
+        copy_column_widths(source_ws, target_ws)
+        
+        # 행 높이 복사
+        for row_idx in source_ws.row_dimensions:
+            if source_ws.row_dimensions[row_idx].height:
+                target_ws.row_dimensions[row_idx].height = source_ws.row_dimensions[row_idx].height
+    except Exception as e:
+        st.warning(f"시트 복사 중 일부 오류 발생: {e}")
 
 # ----------------------- 색상/채우기 라벨링 -----------------------
 def _fill_is_nonempty(fill) -> bool:
@@ -473,6 +570,10 @@ if st.button("✅ 기준 데이터 저장", type="primary", disabled=not (file_o
                 st.session_state["columns"] = cols
                 st.session_state["trim_spaces"] = trim_spaces
                 st.session_state["case_sensitive"] = case_sensitive
+                
+                # 원본 파일 정보 저장 (스타일 복사용)
+                st.session_state["old_file_path"] = file_old
+                st.session_state["old_sheet_name"] = sheet_old
 
                 multiset = Counter([row_tuple(r["norm"], cols) for r in old_rows])
                 mapping = defaultdict(list)
@@ -557,6 +658,10 @@ if st.button("🔍 변경 사항 분석 실행", type="primary",
         old_tuple_to_indices = st.session_state["old_rows_by_tuple_indices"]
         saved_trim_spaces = st.session_state.get("trim_spaces", trim_spaces)
         saved_case_sensitive = st.session_state.get("case_sensitive", case_sensitive)
+        
+        # 비교 파일 정보 저장 (스타일 복사용)
+        st.session_state["new_file_path"] = file_new
+        st.session_state["new_sheet_name"] = sheet_new
 
         # 진행 상황 표시
         progress_bar = st.progress(0)
@@ -732,86 +837,158 @@ if "df_unchanged" in st.session_state:
     st.subheader("💾 결과 다운로드")
     
     from io import BytesIO
-    def to_xlsx(dfs, names):
-        """데이터프레임들을 엑셀 파일로 변환"""
+    
+    def create_result_excel_with_styles():
+        """
+        실제 엑셀 셀과 스타일을 복사하여 결과 파일 생성
+        Sheet1: 변경된 내용 (기준 행 + 비교 행)
+        Sheet2: 추가된 내용 (비교 파일에서 복사)
+        Sheet3: 삭제된 내용 (기준 파일에서 복사)
+        Sheet4: 원본 기준 엑셀 전체
+        """
         try:
+            # 원본 파일 정보 가져오기
+            old_file_path = st.session_state.get("old_file_path")
+            old_sheet_name = st.session_state.get("old_sheet_name")
+            new_file_path = st.session_state.get("new_file_path")
+            new_sheet_name = st.session_state.get("new_sheet_name")
+            
+            if not old_file_path or not old_sheet_name:
+                st.error("원본 파일 정보가 없습니다. 기준 데이터를 먼저 저장해주세요.")
+                return None
+            
+            # 원본 워크북 열기
+            wb_old = load_workbook(old_file_path)
+            ws_old = wb_old[old_sheet_name]
+            
+            wb_new = None
+            ws_new = None
+            if new_file_path and new_sheet_name:
+                wb_new = load_workbook(new_file_path)
+                ws_new = wb_new[new_sheet_name]
+            
+            # 결과 워크북 생성
+            result_wb = Workbook()
+            result_wb.remove(result_wb.active)  # 기본 시트 제거
+            
+            # 최대 열 수 계산
+            max_col = ws_old.max_column
+            if ws_new:
+                max_col = max(max_col, ws_new.max_column)
+            
+            # Sheet1: 변경된 내용
+            if not df_changes.empty:
+                ws_changes = result_wb.create_sheet("변경된내용")
+                current_row = 1
+                
+                # 헤더 추가
+                ws_changes.cell(row=current_row, column=1, value="[기준 파일]")
+                current_row += 1
+                
+                for idx, row in df_changes.iterrows():
+                    old_row_num = row["기준행"]
+                    new_row_num = row["비교행"]
+                    
+                    # 구분선
+                    ws_changes.cell(row=current_row, column=1, value=f"--- 행 {old_row_num} → {new_row_num} ---")
+                    current_row += 1
+                    
+                    # 기준 파일의 행 복사
+                    ws_changes.cell(row=current_row, column=1, value="[변경 전]")
+                    current_row += 1
+                    copy_row_with_style(ws_old, ws_changes, old_row_num, current_row, max_col)
+                    current_row += 1
+                    
+                    # 비교 파일의 행 복사
+                    if ws_new:
+                        ws_changes.cell(row=current_row, column=1, value="[변경 후]")
+                        current_row += 1
+                        copy_row_with_style(ws_new, ws_changes, new_row_num, current_row, max_col)
+                        current_row += 1
+                    
+                    current_row += 1  # 빈 행 추가
+                
+                copy_column_widths(ws_old, ws_changes)
+            
+            # Sheet2: 추가된 내용
+            if not df_added.empty and ws_new:
+                ws_added = result_wb.create_sheet("추가된내용")
+                current_row = 1
+                
+                for idx, row in df_added.iterrows():
+                    new_row_num = row["비교행"]
+                    copy_row_with_style(ws_new, ws_added, new_row_num, current_row, max_col)
+                    current_row += 1
+                
+                copy_column_widths(ws_new, ws_added)
+            
+            # Sheet3: 삭제된 내용
+            if not df_removed.empty:
+                ws_removed = result_wb.create_sheet("삭제된내용")
+                current_row = 1
+                
+                for idx, row in df_removed.iterrows():
+                    old_row_num = row["기준행"]
+                    copy_row_with_style(ws_old, ws_removed, old_row_num, current_row, max_col)
+                    current_row += 1
+                
+                copy_column_widths(ws_old, ws_removed)
+            
+            # Sheet4: 원본 기준 엑셀 전체
+            ws_original = result_wb.create_sheet("원본기준엑셀")
+            copy_entire_sheet(ws_old, ws_original)
+            
+            # 워크북 저장
             bio = BytesIO()
-            with pd.ExcelWriter(bio, engine="openpyxl") as wr:
-                for df, name in zip(dfs, names):
-                    try:
-                        # 시트 이름 정리 (엑셀 시트명 제약: 최대 31자, 특수문자 제한)
-                        safe_name = str(name)[:31].replace("/", "_").replace("\\", "_").replace("*", "_")
-                        
-                        if not df.empty:
-                            # 데이터가 너무 크면 경고
-                            if len(df) > 1000000:  # 엑셀 행 제한
-                                st.warning(f"⚠️ {safe_name} 시트의 데이터가 너무 많습니다. 처음 1,000,000행만 저장됩니다.")
-                                df = df.head(1000000)
-                            df.to_excel(wr, index=False, sheet_name=safe_name)
-                        else:
-                            pd.DataFrame().to_excel(wr, index=False, sheet_name=safe_name)
-                    except Exception as e:
-                        st.warning(f"시트 '{name}' 저장 중 오류: {e}")
-                        continue
+            result_wb.save(bio)
+            bio.seek(0)
+            
+            # 워크북 닫기
+            wb_old.close()
+            if wb_new:
+                wb_new.close()
+            result_wb.close()
             
             return bio.getvalue()
+            
         except Exception as e:
-            st.error(f"엑셀 파일 생성 중 오류: {e}")
+            st.error(f"결과 파일 생성 중 오류: {e}")
+            st.exception(e)
             return None
     
-    col_dl1, col_dl2 = st.columns(2)
+    # 스타일 포함 엑셀 다운로드
+    st.info("💡 다운로드 파일에는 원본 엑셀의 **모든 색상과 스타일**이 포함됩니다.")
     
-    with col_dl1:
-        # 전체 결과 다운로드
-        try:
-            all_data = to_xlsx([df_unchanged, df_changes, df_removed, df_added],
-                              ["동일", "변경", "제거", "추가"])
-            if all_data:
+    try:
+        with st.spinner("엑셀 파일 생성 중... (스타일 복사 중)"):
+            result_data = create_result_excel_with_styles()
+        
+        if result_data:
+            col_dl1, col_dl2 = st.columns(2)
+            
+            with col_dl1:
                 st.download_button(
-                    "📥 전체 결과 다운로드",
-                    data=all_data,
-                    file_name="excel_compare_all_results.xlsx",
+                    "📥 결과 다운로드 (원본 색상 포함)",
+                    data=result_data,
+                    file_name="excel_compare_with_styles.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
+                    use_container_width=True,
+                    type="primary"
                 )
-            else:
-                st.error("전체 결과 파일 생성에 실패했습니다.")
-        except Exception as e:
-            st.error(f"전체 결과 다운로드 준비 중 오류: {e}")
-    
-    with col_dl2:
-        # 변경/추가된 행만 다운로드
-        try:
-            changes_and_additions = []
-            names_modified = []
             
-            if not df_changes.empty:
-                changes_and_additions.append(df_changes)
-                names_modified.append("변경")
-            if not df_added.empty:
-                changes_and_additions.append(df_added)
-                names_modified.append("추가")
-            if not df_removed.empty:
-                changes_and_additions.append(df_removed)
-                names_modified.append("제거")
-            
-            if changes_and_additions:
-                changes_data = to_xlsx(changes_and_additions, names_modified)
-                if changes_data:
-                    st.download_button(
-                        "⭐ 변경/추가/제거만 다운로드",
-                        data=changes_data,
-                        file_name="excel_compare_changes_only.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                        type="primary"
-                    )
-                else:
-                    st.error("변경 사항 파일 생성에 실패했습니다.")
-            else:
-                st.info("변경/추가/제거된 항목이 없습니다.")
-        except Exception as e:
-            st.error(f"변경 사항 다운로드 준비 중 오류: {e}")
+            with col_dl2:
+                st.success(f"""
+                ✅ 다운로드 파일 구성:
+                - Sheet1: 변경된 내용 ({len(df_changes)}건)
+                - Sheet2: 추가된 내용 ({len(df_added)}건)
+                - Sheet3: 삭제된 내용 ({len(df_removed)}건)
+                - Sheet4: 원본 기준 엑셀 (전체)
+                """)
+        else:
+            st.error("결과 파일 생성에 실패했습니다.")
+    except Exception as e:
+        st.error(f"결과 다운로드 준비 중 오류: {e}")
+        st.exception(e)
 
 st.divider()
 st.info("💡 **사용 방법**: 기준 파일을 먼저 저장한 후, 비교 파일을 선택하여 분석을 실행하세요. 행 순서가 달라도 정확히 매칭하며, 모든 사용된 열(값/채우기 존재)을 자동 인식하여 비교합니다.")
