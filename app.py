@@ -14,17 +14,37 @@ st.title("📘 엑셀 행 재정렬 안전 비교 (전체열 + 색상)")
 st.caption("기준 파일과 비교 파일을 선택하면, 행 순서가 달라도 전체 열에서 **값 변경**과 **배경색(채우기) 변경**을 잡아냅니다.")
 
 # 대용량 파일 안내
-with st.expander("ℹ️ 사용 안내", expanded=False):
-    st.info("""
-    **권장 사항:**
-    - 행 개수: 10,000개 이하 (초과 시 자동 제한)
-    - 열 개수: 100개 이하 (초과 시 자동 제한)
-    - 파일 크기: 50MB 이하
+with st.expander("ℹ️ 사용 안내 및 성능 정보", expanded=False):
+    st.markdown("""
+    ### 📊 처리 제한 설정
     
-    **대용량 파일 처리:**
-    - 10,000행 초과 시 처음 10,000행만 처리됩니다.
-    - 100열 초과 시 처음 100열만 처리됩니다.
-    - 메모리 부족 시 파일을 분할하여 처리하세요.
+    **기본 설정 (권장):**
+    - 최대 행 수: 100,000행
+    - 최대 열 수: 200열
+    - 페어링: 제한 모드 (빠름)
+    
+    **설정 조정:**
+    - 설정 메뉴에서 최대 행/열 수를 조정할 수 있습니다
+    - '무제한 페어링' 체크 시 모든 행을 정확히 매칭 (느릴 수 있음)
+    
+    ### ⚡ 페어링 알고리즘
+    
+    **제한 모드 (기본):**
+    - 1단계: 정확히 일치하는 행은 해시 기반으로 빠르게 매칭
+    - 2단계: 일치하지 않는 행은 최대 100,000개 조합까지 유사도 비교
+    - 속도: ⚡⚡⚡ 빠름
+    
+    **무제한 모드:**
+    - 모든 가능한 조합을 전부 확인하여 최적의 매칭 찾기
+    - 매우 정확하지만 시간이 오래 걸릴 수 있음
+    - 속도: 🐌 느림 (행이 많을수록 느려짐)
+    
+    ### 💡 권장 사용법
+    
+    - **일반적인 경우:** 기본 설정 사용
+    - **대용량 파일 (10만 행 이상):** 제한 모드 유지
+    - **정확도가 중요한 경우:** 무제한 페어링 사용
+    - **파일이 매우 큰 경우:** 행/열 제한을 조정하여 필요한 범위만 처리
     """)
 
 # ----------------------- 셀 스타일 복사 -----------------------
@@ -260,7 +280,7 @@ def normalize_value(v, trim_spaces=True, case_sensitive=True):
     return v
 
 # ----------------------- 시트 읽기 -----------------------
-def read_sheet_values_and_fills(file, sheet_name=None, trim_spaces=True, case_sensitive=True):
+def read_sheet_values_and_fills(file, sheet_name=None, trim_spaces=True, case_sensitive=True, max_rows_limit=100000, max_cols_limit=200):
     """
     엑셀 시트의 값과 채우기 정보를 읽어옵니다.
     """
@@ -273,13 +293,13 @@ def read_sheet_values_and_fills(file, sheet_name=None, trim_spaces=True, case_se
         if ws is None:
             raise ValueError("시트를 찾을 수 없습니다.")
         
-        # 대용량 파일 경고
-        if ws.max_row > 10000:
-            st.warning(f"⚠️ 파일에 {ws.max_row}개의 행이 있습니다. 처음 10,000개 행만 처리합니다.")
-        if ws.max_column > 100:
-            st.warning(f"⚠️ 파일에 {ws.max_column}개의 열이 있습니다. 처음 100개 열만 처리합니다.")
+        # 대용량 파일 정보 표시
+        if ws.max_row > max_rows_limit:
+            st.info(f"ℹ️ 파일에 {ws.max_row:,}개의 행이 있습니다. 처음 {max_rows_limit:,}개 행만 처리합니다.")
+        if ws.max_column > max_cols_limit:
+            st.info(f"ℹ️ 파일에 {ws.max_column}개의 열이 있습니다. 처음 {max_cols_limit}개 열만 처리합니다.")
         
-        max_r, max_c = compute_used_bounds(ws)
+        max_r, max_c = compute_used_bounds(ws, max_rows_limit, max_cols_limit)
         
         if max_r == 0 or max_c == 0:
             return [], {}, []
@@ -340,51 +360,101 @@ def read_sheet_values_and_fills(file, sheet_name=None, trim_spaces=True, case_se
 def row_tuple(norm_row, columns):
     return tuple(norm_row.get(col) for col in columns)
 
-def best_pairing(new_rows, old_rows, columns):
+def best_pairing(new_rows, old_rows, columns, unlimited=False):
     """
-    최적 페어링 알고리즘 (대용량 데이터 대응)
+    최적 페어링 알고리즘 (효율적인 해시 기반 + 유사도 계산)
     """
-    candidates = []
-    
-    # 대용량 데이터 처리
-    max_pairs_to_check = 50000  # 최대 확인할 페어 수
-    
     try:
+        # 1단계: 해시 기반 빠른 매칭 (정확히 일치하는 행)
+        old_hash_map = defaultdict(list)
         for i, o in enumerate(old_rows):
-            for j, n in enumerate(new_rows):
-                # 너무 많은 페어는 건너뜀
-                if len(candidates) > max_pairs_to_check:
-                    break
-                
-                try:
-                    eq = sum(1 for col in columns if o["norm"].get(col) == n["norm"].get(col))
-                    if eq > 0:
-                        candidates.append((eq, i, j))
-                except Exception:
-                    continue
+            hash_key = row_tuple(o["norm"], columns)
+            old_hash_map[hash_key].append(i)
+        
+        exact_matches = []
+        unmatched_new = []
+        
+        for j, n in enumerate(new_rows):
+            hash_key = row_tuple(n["norm"], columns)
+            if hash_key in old_hash_map and old_hash_map[hash_key]:
+                i = old_hash_map[hash_key].pop(0)
+                exact_matches.append((i, j, len(columns)))
+            else:
+                unmatched_new.append(j)
+        
+        unmatched_old = []
+        for hash_key, indices in old_hash_map.items():
+            unmatched_old.extend(indices)
+        
+        # 2단계: 유사도 기반 매칭 (일치하지 않는 행들)
+        if not unlimited and len(unmatched_old) * len(unmatched_new) > 100000:
+            # 제한 모드: 샘플링하여 처리
+            max_pairs_to_check = 100000
+            st.info(f"ℹ️ 유사도 비교: {len(unmatched_old)} x {len(unmatched_new)} = {len(unmatched_old) * len(unmatched_new):,}개 조합")
+            st.warning(f"⚠️ 조합이 많아 상위 {max_pairs_to_check:,}개만 확인합니다. '무제한 페어링'을 체크하면 전체를 처리합니다.")
             
-            if len(candidates) > max_pairs_to_check:
-                break
+            # 효율적인 샘플링
+            candidates = []
+            check_count = 0
+            for i in unmatched_old:
+                for j in unmatched_new:
+                    if check_count >= max_pairs_to_check:
+                        break
+                    try:
+                        eq = sum(1 for col in columns if old_rows[i]["norm"].get(col) == new_rows[j]["norm"].get(col))
+                        if eq > 0:
+                            candidates.append((eq, i, j))
+                        check_count += 1
+                    except Exception:
+                        continue
+                if check_count >= max_pairs_to_check:
+                    break
+        else:
+            # 무제한 모드: 모든 조합 확인
+            if len(unmatched_old) * len(unmatched_new) > 10000:
+                st.info(f"ℹ️ 전체 페어링 진행 중: {len(unmatched_old)} x {len(unmatched_new)} = {len(unmatched_old) * len(unmatched_new):,}개 조합")
+            
+            candidates = []
+            total_combinations = len(unmatched_old) * len(unmatched_new)
+            
+            for idx, i in enumerate(unmatched_old):
+                if idx % 100 == 0 and total_combinations > 50000:
+                    progress = (idx * len(unmatched_new)) / total_combinations
+                    st.text(f"페어링 진행 중... {progress*100:.1f}%")
+                
+                for j in unmatched_new:
+                    try:
+                        eq = sum(1 for col in columns if old_rows[i]["norm"].get(col) == new_rows[j]["norm"].get(col))
+                        if eq > 0:
+                            candidates.append((eq, i, j))
+                    except Exception:
+                        continue
         
-        if len(candidates) > max_pairs_to_check:
-            st.warning(f"⚠️ 페어링 후보가 너무 많습니다 ({len(candidates)}개). 상위 {max_pairs_to_check}개만 처리합니다.")
-            candidates = candidates[:max_pairs_to_check]
-        
+        # 3단계: 최적 매칭 선택
         candidates.sort(reverse=True)
-        used_old, used_new = set(), set()
-        pairs = []
+        used_old = set([p[0] for p in exact_matches])
+        used_new = set([p[1] for p in exact_matches])
+        similarity_pairs = []
         
         for eq, i, j in candidates:
             if i in used_old or j in used_new:
                 continue
-            pairs.append((i, j, eq))
+            similarity_pairs.append((i, j, eq))
             used_old.add(i)
             used_new.add(j)
         
+        # 최종 결과
+        all_pairs = exact_matches + similarity_pairs
         leftover_old = [i for i in range(len(old_rows)) if i not in used_old]
         leftover_new = [j for j in range(len(new_rows)) if j not in used_new]
         
-        return pairs, leftover_old, leftover_new
+        # 결과 요약
+        if exact_matches:
+            st.success(f"✅ 정확히 일치: {len(exact_matches)}쌍")
+        if similarity_pairs:
+            st.info(f"ℹ️ 유사도 매칭: {len(similarity_pairs)}쌍")
+        
+        return all_pairs, leftover_old, leftover_new
     
     except Exception as e:
         st.error(f"페어링 중 오류 발생: {e}")
@@ -484,13 +554,22 @@ def get_excel_files_in_folder(folder_path):
 
 # ----------------------- UI -----------------------
 with st.expander("⚙️ 설정", expanded=True):
-    col_opt1, col_opt2 = st.columns(2)
+    col_opt1, col_opt2, col_opt3 = st.columns(3)
     with col_opt1:
         trim_spaces = st.checkbox("앞뒤 공백 무시", value=True)
         case_sensitive = st.checkbox("대소문자 구분", value=True)
     with col_opt2:
         # 파일 입력 방식 선택
         input_mode = st.radio("파일 입력 방식", ["로컬 폴더", "파일 업로드"], horizontal=True)
+    with col_opt3:
+        # 처리 제한 설정
+        st.write("**처리 제한 설정**")
+        max_rows = st.number_input("최대 행 수", min_value=1000, max_value=1000000, value=100000, step=1000, 
+                                    help="처리할 최대 행 수 (기본: 100,000행)")
+        max_cols = st.number_input("최대 열 수", min_value=10, max_value=1000, value=200, step=10,
+                                    help="처리할 최대 열 수 (기본: 200열)")
+        unlimited_pairing = st.checkbox("무제한 페어링", value=False, 
+                                        help="체크 시 모든 행을 페어링합니다 (대용량 파일은 느릴 수 있음)")
 
 st.subheader("1️⃣ 기준(이전) 파일 선택")
 
@@ -560,7 +639,9 @@ else:
 if st.button("✅ 기준 데이터 저장", type="primary", disabled=not (file_old and sheet_old)):
     try:
         with st.spinner("기준 파일을 읽는 중..."):
-            old_rows, old_fills, cols = read_sheet_values_and_fills(file_old, sheet_old, trim_spaces, case_sensitive)
+            old_rows, old_fills, cols = read_sheet_values_and_fills(
+                file_old, sheet_old, trim_spaces, case_sensitive, max_rows, max_cols
+            )
             
             if not old_rows:
                 st.error("❌ 기준 파일에 데이터가 없습니다.")
@@ -570,6 +651,9 @@ if st.button("✅ 기준 데이터 저장", type="primary", disabled=not (file_o
                 st.session_state["columns"] = cols
                 st.session_state["trim_spaces"] = trim_spaces
                 st.session_state["case_sensitive"] = case_sensitive
+                st.session_state["max_rows"] = max_rows
+                st.session_state["max_cols"] = max_cols
+                st.session_state["unlimited_pairing"] = unlimited_pairing
                 
                 # 원본 파일 정보 저장 (스타일 복사용)
                 st.session_state["old_file_path"] = file_old
@@ -582,7 +666,7 @@ if st.button("✅ 기준 데이터 저장", type="primary", disabled=not (file_o
 
                 st.session_state["old_rows_norm_multiset"] = multiset
                 st.session_state["old_rows_by_tuple_indices"] = mapping
-                st.success(f"✅ 기준 데이터 저장 완료: {len(old_rows)} 행, 사용 열: {len(cols)}개 ({cols[0]}~{cols[-1]})")
+                st.success(f"✅ 기준 데이터 저장 완료: {len(old_rows):,} 행, 사용 열: {len(cols)}개 ({cols[0]}~{cols[-1]})")
     except Exception as e:
         st.error(f"❌ 기준 파일 처리 중 오류 발생")
         st.exception(e)
@@ -658,6 +742,9 @@ if st.button("🔍 변경 사항 분석 실행", type="primary",
         old_tuple_to_indices = st.session_state["old_rows_by_tuple_indices"]
         saved_trim_spaces = st.session_state.get("trim_spaces", trim_spaces)
         saved_case_sensitive = st.session_state.get("case_sensitive", case_sensitive)
+        saved_max_rows = st.session_state.get("max_rows", 100000)
+        saved_max_cols = st.session_state.get("max_cols", 200)
+        saved_unlimited_pairing = st.session_state.get("unlimited_pairing", False)
         
         # 비교 파일 정보 저장 (스타일 복사용)
         st.session_state["new_file_path"] = file_new
@@ -671,7 +758,7 @@ if st.button("🔍 변경 사항 분석 실행", type="primary",
         progress_bar.progress(10)
         
         new_rows, new_fills, cols_new = read_sheet_values_and_fills(
-            file_new, sheet_new, saved_trim_spaces, saved_case_sensitive
+            file_new, sheet_new, saved_trim_spaces, saved_case_sensitive, saved_max_rows, saved_max_cols
         )
         
         if not new_rows:
@@ -710,7 +797,7 @@ if st.button("🔍 변경 사항 분석 실행", type="primary",
             
             old_left = [old_rows[i] for i in sorted(remaining_old_indices)]
             new_left = [new_rows[j] for j in sorted(remaining_new_indices)]
-            pairs, leftover_old_idx, leftover_new_idx = best_pairing(new_left, old_left, columns)
+            pairs, leftover_old_idx, leftover_new_idx = best_pairing(new_left, old_left, columns, saved_unlimited_pairing)
 
             progress_bar.progress(60)
             status_text.text("📊 변경 내역 생성 중...")
