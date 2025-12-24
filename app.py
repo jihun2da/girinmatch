@@ -11,6 +11,20 @@ st.set_page_config(page_title="엑셀 행 재정렬 안전 비교 (전체열 + �
 st.title("📘 엑셀 행 재정렬 안전 비교 (전체열 + 색상)")
 st.caption("기준 파일과 비교 파일을 선택하면, 행 순서가 달라도 전체 열에서 **값 변경**과 **배경색(채우기) 변경**을 잡아냅니다.")
 
+# 대용량 파일 안내
+with st.expander("ℹ️ 사용 안내", expanded=False):
+    st.info("""
+    **권장 사항:**
+    - 행 개수: 10,000개 이하 (초과 시 자동 제한)
+    - 열 개수: 100개 이하 (초과 시 자동 제한)
+    - 파일 크기: 50MB 이하
+    
+    **대용량 파일 처리:**
+    - 10,000행 초과 시 처음 10,000행만 처리됩니다.
+    - 100열 초과 시 처음 100열만 처리됩니다.
+    - 메모리 부족 시 파일을 분할하여 처리하세요.
+    """)
+
 # ----------------------- 색상/채우기 라벨링 -----------------------
 def _fill_is_nonempty(fill) -> bool:
     if fill is None:
@@ -92,23 +106,54 @@ def fill_to_label(fill) -> str:
     return friendly or hx
 
 # ----------------------- 범위(행/열) 계산 -----------------------
-def compute_used_bounds(ws):
-    max_r, max_c = 0, 0
-    for r in range(1, ws.max_row + 1):
-        row_has_any = False
-        for c in range(1, ws.max_column + 1):
-            cell = ws.cell(row=r, column=c)
-            if (cell.value not in (None, "")) or _fill_is_nonempty(cell.fill):
-                row_has_any = True
-                if c > max_c:
-                    max_c = c
-        if row_has_any:
-            max_r = r
-    if max_r == 0:
-        max_r = ws.max_row
-    if max_c == 0:
-        max_c = ws.max_column
-    return max_r, max_c
+def compute_used_bounds(ws, max_rows_limit=10000, max_cols_limit=100):
+    """
+    실제 사용된 행/열 범위를 계산 (대용량 파일 대응)
+    """
+    try:
+        # 제한 적용
+        max_possible_r = min(ws.max_row, max_rows_limit)
+        max_possible_c = min(ws.max_column, max_cols_limit)
+        
+        max_r, max_c = 0, 0
+        
+        # 역순으로 검색하여 최적화
+        for r in range(max_possible_r, 0, -1):
+            row_has_any = False
+            for c in range(1, max_possible_c + 1):
+                try:
+                    cell = ws.cell(row=r, column=c)
+                    if (cell.value not in (None, "")) or _fill_is_nonempty(cell.fill):
+                        row_has_any = True
+                        if c > max_c:
+                            max_c = c
+                except Exception:
+                    continue
+            if row_has_any:
+                max_r = r
+                break
+        
+        # 최대 열 확인
+        if max_r > 0 and max_c == 0:
+            for r in range(1, min(max_r + 1, 100)):  # 샘플링
+                for c in range(1, max_possible_c + 1):
+                    try:
+                        cell = ws.cell(row=r, column=c)
+                        if (cell.value not in (None, "")) or _fill_is_nonempty(cell.fill):
+                            if c > max_c:
+                                max_c = c
+                    except Exception:
+                        continue
+        
+        if max_r == 0:
+            max_r = min(ws.max_row, max_rows_limit)
+        if max_c == 0:
+            max_c = min(ws.max_column, max_cols_limit)
+        
+        return max_r, max_c
+    except Exception as e:
+        st.warning(f"범위 계산 중 오류 발생, 기본값 사용: {e}")
+        return min(ws.max_row, max_rows_limit), min(ws.max_column, max_cols_limit)
 
 # ----------------------- 정규화 -----------------------
 def normalize_value(v, trim_spaces=True, case_sensitive=True):
@@ -119,91 +164,222 @@ def normalize_value(v, trim_spaces=True, case_sensitive=True):
 
 # ----------------------- 시트 읽기 -----------------------
 def read_sheet_values_and_fills(file, sheet_name=None, trim_spaces=True, case_sensitive=True):
-    wb = load_workbook(file, data_only=True)
-    ws = wb[sheet_name] if sheet_name else wb.active
-    max_r, max_c = compute_used_bounds(ws)
-    cols = [get_column_letter(c) for c in range(1, max_c + 1)]
+    """
+    엑셀 시트의 값과 채우기 정보를 읽어옵니다.
+    """
+    wb = None
+    try:
+        # read_only=False로 열어야 스타일 정보를 읽을 수 있음
+        wb = load_workbook(file, data_only=True, read_only=False)
+        ws = wb[sheet_name] if sheet_name else wb.active
+        
+        if ws is None:
+            raise ValueError("시트를 찾을 수 없습니다.")
+        
+        # 대용량 파일 경고
+        if ws.max_row > 10000:
+            st.warning(f"⚠️ 파일에 {ws.max_row}개의 행이 있습니다. 처음 10,000개 행만 처리합니다.")
+        if ws.max_column > 100:
+            st.warning(f"⚠️ 파일에 {ws.max_column}개의 열이 있습니다. 처음 100개 열만 처리합니다.")
+        
+        max_r, max_c = compute_used_bounds(ws)
+        
+        if max_r == 0 or max_c == 0:
+            return [], {}, []
+        
+        cols = [get_column_letter(c) for c in range(1, max_c + 1)]
 
-    rows = []
-    fills = {}
-    for r in range(1, max_r + 1):
-        orig = {}
-        norm = {}
-        empty_all = True
-        for c in range(1, max_c + 1):
-            cell = ws.cell(row=r, column=c)
-            v = cell.value
-            col = get_column_letter(c)
-            orig[col] = v
-            norm[col] = normalize_value(v, trim_spaces, case_sensitive)
-            fills[(r, c)] = fill_to_label(cell.fill)
-            if (v not in (None, "")) or _fill_is_nonempty(cell.fill):
-                empty_all = False
-        if not empty_all:
-            rows.append({"_row": r, "orig": orig, "norm": norm})
-    return rows, fills, cols
+        rows = []
+        fills = {}
+        
+        for r in range(1, max_r + 1):
+            try:
+                orig = {}
+                norm = {}
+                empty_all = True
+                
+                for c in range(1, max_c + 1):
+                    try:
+                        cell = ws.cell(row=r, column=c)
+                        v = cell.value
+                        col = get_column_letter(c)
+                        orig[col] = v
+                        norm[col] = normalize_value(v, trim_spaces, case_sensitive)
+                        
+                        # 채우기 정보
+                        try:
+                            fills[(r, c)] = fill_to_label(cell.fill)
+                        except Exception:
+                            fills[(r, c)] = "No Fill"
+                        
+                        if (v not in (None, "")) or _fill_is_nonempty(cell.fill):
+                            empty_all = False
+                    except Exception as e:
+                        # 개별 셀 오류는 무시
+                        col = get_column_letter(c)
+                        orig[col] = None
+                        norm[col] = None
+                        fills[(r, c)] = "No Fill"
+                
+                if not empty_all:
+                    rows.append({"_row": r, "orig": orig, "norm": norm})
+            except Exception as e:
+                st.warning(f"행 {r} 처리 중 오류 발생, 건너뜀: {e}")
+                continue
+        
+        return rows, fills, cols
+    
+    except Exception as e:
+        st.error(f"파일 읽기 실패: {e}")
+        raise
+    finally:
+        if wb is not None:
+            try:
+                wb.close()
+            except Exception:
+                pass
 
 # ----------------------- 페어링 -----------------------
 def row_tuple(norm_row, columns):
     return tuple(norm_row.get(col) for col in columns)
 
 def best_pairing(new_rows, old_rows, columns):
+    """
+    최적 페어링 알고리즘 (대용량 데이터 대응)
+    """
     candidates = []
-    for i, o in enumerate(old_rows):
-        for j, n in enumerate(new_rows):
-            eq = sum(1 for col in columns if o["norm"].get(col) == n["norm"].get(col))
-            if eq > 0:
-                candidates.append((eq, i, j))
-    candidates.sort(reverse=True)
-    used_old, used_new = set(), set()
-    pairs = []
-    for eq, i, j in candidates:
-        if i in used_old or j in used_new:
-            continue
-        pairs.append((i, j, eq))
-        used_old.add(i); used_new.add(j)
-    leftover_old = [i for i in range(len(old_rows)) if i not in used_old]
-    leftover_new = [j for j in range(len(new_rows)) if j not in used_new]
-    return pairs, leftover_old, leftover_new
+    
+    # 대용량 데이터 처리
+    max_pairs_to_check = 50000  # 최대 확인할 페어 수
+    
+    try:
+        for i, o in enumerate(old_rows):
+            for j, n in enumerate(new_rows):
+                # 너무 많은 페어는 건너뜀
+                if len(candidates) > max_pairs_to_check:
+                    break
+                
+                try:
+                    eq = sum(1 for col in columns if o["norm"].get(col) == n["norm"].get(col))
+                    if eq > 0:
+                        candidates.append((eq, i, j))
+                except Exception:
+                    continue
+            
+            if len(candidates) > max_pairs_to_check:
+                break
+        
+        if len(candidates) > max_pairs_to_check:
+            st.warning(f"⚠️ 페어링 후보가 너무 많습니다 ({len(candidates)}개). 상위 {max_pairs_to_check}개만 처리합니다.")
+            candidates = candidates[:max_pairs_to_check]
+        
+        candidates.sort(reverse=True)
+        used_old, used_new = set(), set()
+        pairs = []
+        
+        for eq, i, j in candidates:
+            if i in used_old or j in used_new:
+                continue
+            pairs.append((i, j, eq))
+            used_old.add(i)
+            used_new.add(j)
+        
+        leftover_old = [i for i in range(len(old_rows)) if i not in used_old]
+        leftover_new = [j for j in range(len(new_rows)) if j not in used_new]
+        
+        return pairs, leftover_old, leftover_new
+    
+    except Exception as e:
+        st.error(f"페어링 중 오류 발생: {e}")
+        return [], list(range(len(old_rows))), list(range(len(new_rows)))
 
 # ----------------------- 변경 레코드 -----------------------
+def truncate_value(val, max_len=50):
+    """값이 너무 길면 잘라냅니다."""
+    if val is None:
+        return ""
+    s = str(val)
+    if len(s) > max_len:
+        return s[:max_len] + "..."
+    return s
+
 def build_diff_record(old_row, new_row, old_fills, new_fills, columns):
+    """변경 사항을 기록합니다."""
     changes = []
-    for idx, col in enumerate(columns, start=1):
-        r_old = old_row["_row"]
-        r_new = new_row["_row"]
-        ov = old_row["orig"].get(col)
-        nv = new_row["orig"].get(col)
-        value_changed = old_row["norm"].get(col) != new_row["norm"].get(col)
+    try:
+        for idx, col in enumerate(columns, start=1):
+            try:
+                r_old = old_row["_row"]
+                r_new = new_row["_row"]
+                ov = old_row["orig"].get(col)
+                nv = new_row["orig"].get(col)
+                value_changed = old_row["norm"].get(col) != new_row["norm"].get(col)
 
-        ofill = old_fills.get((r_old, idx), "No Fill")
-        nfill = new_fills.get((r_new, idx), "No Fill")
-        fill_changed = ofill != nfill
+                ofill = old_fills.get((r_old, idx), "No Fill")
+                nfill = new_fills.get((r_new, idx), "No Fill")
+                fill_changed = ofill != nfill
 
-        if value_changed or fill_changed:
-            if value_changed and fill_changed:
-                changes.append(f"{col}열 값 '{ov}'→'{nv}', 색 '{ofill}'→'{nfill}'")
-            elif value_changed:
-                changes.append(f"{col}열 값 '{ov}'→'{nv}'")
-            elif fill_changed:
-                changes.append(f"{col}열 색 '{ofill}'→'{nfill}'")
-    msg = "; ".join(changes) if changes else "변경 없음"
-    return {
-        "기준행": old_row["_row"],
-        "비교행": new_row["_row"],
-        "변경요약": msg
-    }
+                if value_changed or fill_changed:
+                    # 값을 잘라서 표시
+                    ov_str = truncate_value(ov, 30)
+                    nv_str = truncate_value(nv, 30)
+                    
+                    if value_changed and fill_changed:
+                        changes.append(f"{col}열 값 '{ov_str}'→'{nv_str}', 색 '{ofill}'→'{nfill}'")
+                    elif value_changed:
+                        changes.append(f"{col}열 값 '{ov_str}'→'{nv_str}'")
+                    elif fill_changed:
+                        changes.append(f"{col}열 색 '{ofill}'→'{nfill}'")
+            except Exception as e:
+                changes.append(f"{col}열 처리 오류")
+                continue
+        
+        # 변경 사항이 너무 많으면 요약
+        if len(changes) > 10:
+            msg = f"{len(changes)}개 열 변경됨 (처음 10개: " + "; ".join(changes[:10]) + "...)"
+        else:
+            msg = "; ".join(changes) if changes else "변경 없음"
+        
+        return {
+            "기준행": old_row["_row"],
+            "비교행": new_row["_row"],
+            "변경요약": msg
+        }
+    except Exception as e:
+        return {
+            "기준행": old_row.get("_row", "?"),
+            "비교행": new_row.get("_row", "?"),
+            "변경요약": f"처리 오류: {str(e)[:50]}"
+        }
 
 # ----------------------- 로컬 폴더에서 파일 가져오기 -----------------------
 def get_excel_files_in_folder(folder_path):
     """폴더 내의 모든 엑셀 파일 목록 반환"""
     try:
-        if not folder_path or not os.path.exists(folder_path):
+        if not folder_path:
             return []
+        
+        # 경로 정규화
+        folder_path = os.path.normpath(folder_path)
+        
+        if not os.path.exists(folder_path):
+            return []
+        
+        if not os.path.isdir(folder_path):
+            return []
+        
         path = Path(folder_path)
-        excel_files = list(path.glob("*.xlsx")) + list(path.glob("*.xls"))
-        # 임시 파일 제외
-        excel_files = [f for f in excel_files if not f.name.startswith("~$")]
+        excel_files = []
+        
+        try:
+            excel_files = list(path.glob("*.xlsx")) + list(path.glob("*.xls"))
+        except Exception as e:
+            st.warning(f"파일 검색 중 오류: {e}")
+            return []
+        
+        # 임시 파일 및 숨김 파일 제외
+        excel_files = [f for f in excel_files if not f.name.startswith("~$") and not f.name.startswith(".")]
+        
         return sorted([f.name for f in excel_files])
     except Exception as e:
         st.error(f"폴더 읽기 오류: {e}")
@@ -237,12 +413,21 @@ if input_mode == "로컬 폴더":
             with c2:
                 sheet_old = None
                 if file_old:
+                    wb = None
                     try:
                         wb = load_workbook(file_old, read_only=True, data_only=True)
-                        sheet_old = st.selectbox("시트 선택(기준)", options=wb.sheetnames, index=0, key="old_sheet")
-                        wb.close()
+                        if wb and wb.sheetnames:
+                            sheet_old = st.selectbox("시트 선택(기준)", options=wb.sheetnames, index=0, key="old_sheet")
+                        else:
+                            st.error("시트를 찾을 수 없습니다.")
                     except Exception as e:
                         st.error(f"기준 파일 시트 읽기 실패: {e}")
+                    finally:
+                        if wb:
+                            try:
+                                wb.close()
+                            except Exception:
+                                pass
         else:
             st.warning("⚠️ 선택한 폴더에 엑셀 파일이 없습니다.")
             file_old = None
@@ -259,12 +444,21 @@ else:
     with c2:
         sheet_old = None
         if file_old:
+            wb = None
             try:
                 wb = load_workbook(file_old, read_only=True, data_only=True)
-                sheet_old = st.selectbox("시트 선택(기준)", options=wb.sheetnames, index=0)
-                wb.close()
+                if wb and wb.sheetnames:
+                    sheet_old = st.selectbox("시트 선택(기준)", options=wb.sheetnames, index=0)
+                else:
+                    st.error("시트를 찾을 수 없습니다.")
             except Exception as e:
                 st.error(f"기준 파일 시트 읽기 실패: {e}")
+            finally:
+                if wb:
+                    try:
+                        wb.close()
+                    except Exception:
+                        pass
 
 if st.button("✅ 기준 데이터 저장", type="primary", disabled=not (file_old and sheet_old)):
     try:
@@ -307,12 +501,21 @@ if input_mode == "로컬 폴더":
             with c4:
                 sheet_new = None
                 if file_new:
+                    wb2 = None
                     try:
                         wb2 = load_workbook(file_new, read_only=True, data_only=True)
-                        sheet_new = st.selectbox("시트 선택(비교)", options=wb2.sheetnames, index=0, key="new_sheet")
-                        wb2.close()
+                        if wb2 and wb2.sheetnames:
+                            sheet_new = st.selectbox("시트 선택(비교)", options=wb2.sheetnames, index=0, key="new_sheet")
+                        else:
+                            st.error("시트를 찾을 수 없습니다.")
                     except Exception as e:
                         st.error(f"비교 파일 시트 읽기 실패: {e}")
+                    finally:
+                        if wb2:
+                            try:
+                                wb2.close()
+                            except Exception:
+                                pass
         else:
             file_new = None
             sheet_new = None
@@ -327,12 +530,21 @@ else:
     with c4:
         sheet_new = None
         if file_new:
+            wb2 = None
             try:
                 wb2 = load_workbook(file_new, read_only=True, data_only=True)
-                sheet_new = st.selectbox("시트 선택(비교)", options=wb2.sheetnames, index=0)
-                wb2.close()
+                if wb2 and wb2.sheetnames:
+                    sheet_new = st.selectbox("시트 선택(비교)", options=wb2.sheetnames, index=0)
+                else:
+                    st.error("시트를 찾을 수 없습니다.")
             except Exception as e:
                 st.error(f"비교 파일 시트 읽기 실패: {e}")
+            finally:
+                if wb2:
+                    try:
+                        wb2.close()
+                    except Exception:
+                        pass
 
 if st.button("🔍 변경 사항 분석 실행", type="primary",
              disabled=not (file_new and sheet_new and ("old_rows" in st.session_state))):
@@ -521,54 +733,85 @@ if "df_unchanged" in st.session_state:
     
     from io import BytesIO
     def to_xlsx(dfs, names):
-        bio = BytesIO()
-        with pd.ExcelWriter(bio, engine="openpyxl") as wr:
-            for df, name in zip(dfs, names):
-                if not df.empty:
-                    df.to_excel(wr, index=False, sheet_name=name)
-                else:
-                    pd.DataFrame().to_excel(wr, index=False, sheet_name=name)
-        return bio.getvalue()
+        """데이터프레임들을 엑셀 파일로 변환"""
+        try:
+            bio = BytesIO()
+            with pd.ExcelWriter(bio, engine="openpyxl") as wr:
+                for df, name in zip(dfs, names):
+                    try:
+                        # 시트 이름 정리 (엑셀 시트명 제약: 최대 31자, 특수문자 제한)
+                        safe_name = str(name)[:31].replace("/", "_").replace("\\", "_").replace("*", "_")
+                        
+                        if not df.empty:
+                            # 데이터가 너무 크면 경고
+                            if len(df) > 1000000:  # 엑셀 행 제한
+                                st.warning(f"⚠️ {safe_name} 시트의 데이터가 너무 많습니다. 처음 1,000,000행만 저장됩니다.")
+                                df = df.head(1000000)
+                            df.to_excel(wr, index=False, sheet_name=safe_name)
+                        else:
+                            pd.DataFrame().to_excel(wr, index=False, sheet_name=safe_name)
+                    except Exception as e:
+                        st.warning(f"시트 '{name}' 저장 중 오류: {e}")
+                        continue
+            
+            return bio.getvalue()
+        except Exception as e:
+            st.error(f"엑셀 파일 생성 중 오류: {e}")
+            return None
     
     col_dl1, col_dl2 = st.columns(2)
     
     with col_dl1:
         # 전체 결과 다운로드
-        st.download_button(
-            "📥 전체 결과 다운로드",
-            data=to_xlsx([df_unchanged, df_changes, df_removed, df_added],
-                         ["동일", "변경", "제거", "추가"]),
-            file_name="excel_compare_all_results.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
+        try:
+            all_data = to_xlsx([df_unchanged, df_changes, df_removed, df_added],
+                              ["동일", "변경", "제거", "추가"])
+            if all_data:
+                st.download_button(
+                    "📥 전체 결과 다운로드",
+                    data=all_data,
+                    file_name="excel_compare_all_results.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+            else:
+                st.error("전체 결과 파일 생성에 실패했습니다.")
+        except Exception as e:
+            st.error(f"전체 결과 다운로드 준비 중 오류: {e}")
     
     with col_dl2:
         # 변경/추가된 행만 다운로드
-        changes_and_additions = []
-        names_modified = []
-        
-        if not df_changes.empty:
-            changes_and_additions.append(df_changes)
-            names_modified.append("변경")
-        if not df_added.empty:
-            changes_and_additions.append(df_added)
-            names_modified.append("추가")
-        if not df_removed.empty:
-            changes_and_additions.append(df_removed)
-            names_modified.append("제거")
-        
-        if changes_and_additions:
-            st.download_button(
-                "⭐ 변경/추가/제거만 다운로드",
-                data=to_xlsx(changes_and_additions, names_modified),
-                file_name="excel_compare_changes_only.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                type="primary"
-            )
-        else:
-            st.info("변경/추가/제거된 항목이 없습니다.")
+        try:
+            changes_and_additions = []
+            names_modified = []
+            
+            if not df_changes.empty:
+                changes_and_additions.append(df_changes)
+                names_modified.append("변경")
+            if not df_added.empty:
+                changes_and_additions.append(df_added)
+                names_modified.append("추가")
+            if not df_removed.empty:
+                changes_and_additions.append(df_removed)
+                names_modified.append("제거")
+            
+            if changes_and_additions:
+                changes_data = to_xlsx(changes_and_additions, names_modified)
+                if changes_data:
+                    st.download_button(
+                        "⭐ 변경/추가/제거만 다운로드",
+                        data=changes_data,
+                        file_name="excel_compare_changes_only.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        type="primary"
+                    )
+                else:
+                    st.error("변경 사항 파일 생성에 실패했습니다.")
+            else:
+                st.info("변경/추가/제거된 항목이 없습니다.")
+        except Exception as e:
+            st.error(f"변경 사항 다운로드 준비 중 오류: {e}")
 
 st.divider()
 st.info("💡 **사용 방법**: 기준 파일을 먼저 저장한 후, 비교 파일을 선택하여 분석을 실행하세요. 행 순서가 달라도 정확히 매칭하며, 모든 사용된 열(값/채우기 존재)을 자동 인식하여 비교합니다.")
